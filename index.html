@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Dear Layla</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #17140f;
+    overflow: hidden;
+    font-family: "SongTi", "Noto Serif SC", serif;
+  }
+  /* 固定 600x800 的舞台，整体用 transform 缩放适配屏幕 */
+  #stage {
+    position: absolute;
+    top: 50%; left: 50%;
+    width: 600px; height: 800px;
+    transform: translate(-50%, -50%);
+    transform-origin: center center;
+    box-shadow: 0 20px 60px rgba(0,0,0,.55);
+  }
+  #stage canvas { position: absolute; top: 0; left: 0; }
+  #bg  { z-index: 1; }
+  #fx  { z-index: 2; filter: blur(1.7px); } /* 雨滴层：整体恒定轻微模糊（CSS，全平台生效） */
+  .line { z-index: 3; pointer-events: none; will-change: filter; }
+  #hint {
+    position: fixed;
+    left: 50%; bottom: 6%;
+    transform: translateX(-50%);
+    color: rgba(232, 226, 210, 0.75);
+    font-size: 14px;
+    letter-spacing: 4px;
+    pointer-events: none;
+    transition: opacity 2.5s ease;
+    text-shadow: 0 1px 4px rgba(0,0,0,.6);
+    white-space: nowrap;
+    z-index: 9;
+  }
+  #hint.faded { opacity: 0; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="bg" width="600" height="800"></canvas>
+  <canvas id="fx" width="600" height="800"></canvas>
+</div>
+<div id="hint">移动手指，靠近的字会浮现</div>
+<script>
+(() => {
+  // ===== 参数（与 Processing 版一致，可随意调整）=====
+  const W = 600, H = 800;
+  const poemTextSize = 15;
+  const letterX = 115;
+  const poemStartY = 235;
+  const lineGap = 25;          // 段内行距
+  const paragraphGap = 50;     // 段落间距
+  const loveTextX = 420, loveTextY = 700, loveTextSize = 15;
+  const clearSpeed = 0.08;     // 靠近后变清晰的速度
+  const blurBackSpeed = 0.05;  // 离开后重新模糊的速度
+  const mouseAffectDistance = 85;      // 开始影响的距离
+  const mouseFullClearDistance = 30;   // 完全清晰的距离
+  const rainChance = 0.01;     // 雨滴频率
+  const maxRainDrops = 3;      // 同屏雨滴上限
+  const rainClearAmount = 1.5; // 雨滴让文字额外清晰的程度
+  const rainAffectDistance = 80;
+  const waterLife = 170;       // 水渍停留时长（帧）
+  const rippleLightColor = [248, 247, 240];
+  const rippleDarkColor = [118, 116, 108];
+  const rippleLightAlpha = 54, rippleDarkAlpha = 42;
+
+  // ===== 信的内容 =====
+  const paragraphs = [
+    ["Dear Layla："],
+    ["认识的8年里，",
+     "感谢你为我投入的时间、精力、金钱、自尊，",
+     "和你一部分的自我，",
+     "来证明你真的如此爱我。"],
+    ["新的一岁，",
+     "愿你有成为落叶的自由，",
+     "也有长成树的底气。"],
+    ["生日快乐。",
+     "我们依旧拥有珍贵的一切。"]
+  ];
+
+  const stage = document.getElementById('stage');
+  const bgCanvas = document.getElementById('bg');
+  const fxCanvas = document.getElementById('fx');
+  const bgCtx = bgCanvas.getContext('2d');
+  const fxCtx = fxCanvas.getContext('2d');
+
+  // 高分屏适配：600x800 逻辑尺寸，物理分辨率放大
+  const DPR = Math.min(window.devicePixelRatio || 1, 2);
+  for (const c of [bgCanvas, fxCanvas]) {
+    c.width = W * DPR; c.height = H * DPR;
+    c.style.width = W + 'px'; c.style.height = H + 'px';
+  }
+  bgCtx.scale(DPR, DPR);
+  fxCtx.scale(DPR, DPR);
+
+  // 舞台整体缩放适配屏幕（保持比例）
+  function fitStage() {
+    const pad = 24;
+    const scale = Math.min(
+      (window.innerWidth - pad) / W,
+      (window.innerHeight - pad) / H,
+      1.2
+    );
+    stage.style.transform = 'translate(-50%, -50%) scale(' + scale + ')';
+  }
+  window.addEventListener('resize', fitStage);
+  fitStage();
+
+  // 鼠标 / 触摸位置 → 逻辑坐标（舞台被缩放过，需要换算）
+  let mouseX = -999, mouseY = -999, hasPointer = false;
+  function toLocal(cx, cy) {
+    const r = bgCanvas.getBoundingClientRect();
+    return [(cx - r.left) / r.width * W, (cy - r.top) / r.height * H];
+  }
+  stage.addEventListener('mousemove', e => {
+    [mouseX, mouseY] = toLocal(e.clientX, e.clientY);
+    hasPointer = true; fadeHint();
+  });
+  stage.addEventListener('mouseleave', () => { hasPointer = false; mouseX = mouseY = -999; });
+  stage.addEventListener('touchstart', e => {
+    const t = e.touches[0];
+    [mouseX, mouseY] = toLocal(t.clientX, t.clientY);
+    hasPointer = true; fadeHint(); e.preventDefault();
+  }, { passive: false });
+  stage.addEventListener('touchmove', e => {
+    const t = e.touches[0];
+    [mouseX, mouseY] = toLocal(t.clientX, t.clientY);
+    e.preventDefault();
+  }, { passive: false });
+  stage.addEventListener('touchend', () => { hasPointer = false; mouseX = mouseY = -999; });
+
+  let hintFaded = false;
+  function fadeHint() {
+    if (hintFaded) return;
+    hintFaded = true;
+    document.getElementById('hint').classList.add('faded');
+  }
+
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const map = (v, a, b, c, d) => c + (v - a) / (b - a) * (d - c);
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  // 按指定字号测量文本宽度
+  const measureCtx = document.createElement('canvas').getContext('2d');
+  function measureTextAtSize(text, size) {
+    measureCtx.font = size + 'px "SongTi", "Noto Serif SC", serif';
+    return measureCtx.measureText(text).width;
+  }
+
+  // ===== LineText：每行一个独立画布元素，模糊用 CSS filter（iOS Safari 也支持）=====
+  class LineText {
+    constructor(content, x, y, size) {
+      this.content = content;
+      this.x = x; this.y = y;
+      this.size = size;
+      this.clarity = 0;
+      this.rainBoost = 0;
+
+      this.lw = measureTextAtSize(content, size) + 40;
+      this.lh = size + 42;
+
+      this.canvas = document.createElement('canvas');
+      this.canvas.className = 'line';
+      this.canvas.width = Math.ceil(this.lw * DPR);
+      this.canvas.height = Math.ceil(this.lh * DPR);
+      this.canvas.style.width = this.lw + 'px';
+      this.canvas.style.height = this.lh + 'px';
+      this.canvas.style.left = (x - 20) + 'px';
+      this.canvas.style.top = (y - size - 16) + 'px';
+      stage.appendChild(this.canvas);
+      this.lctx = this.canvas.getContext('2d');
+    }
+    update(isActive) {
+      let target = 0;
+      if (isActive && hasPointer) {
+        const d = this.distanceTo(mouseX, mouseY);
+        target = clamp(map(d, mouseAffectDistance, mouseFullClearDistance, 0, 1), 0, 1);
+      }
+      target = Math.max(target, this.rainBoost);
+      if (target > this.clarity) this.clarity = lerp(this.clarity, target, clearSpeed);
+      else this.clarity = lerp(this.clarity, target, blurBackSpeed);
+      this.rainBoost *= 0.94;
+    }
+    addRainBoost(dx, dy) {
+      const d = this.distanceTo(dx, dy);
+      if (d < rainAffectDistance) {
+        this.rainBoost = Math.max(this.rainBoost, map(d, rainAffectDistance, 0, 0.04, rainClearAmount));
+      }
+    }
+    distanceTo(px, py) {
+      const left = this.x;
+      const right = this.x + measureTextAtSize(this.content, this.size);
+      const top = this.y - this.size - 8;
+      const bottom = this.y + 8;
+      const cx = clamp(px, left, right), cy = clamp(py, top, bottom);
+      return Math.hypot(px - cx, py - cy);
+    }
+    display() {
+      const blurAmount = map(this.clarity, 0, 1, 8, 0);
+      const alpha = map(this.clarity, 0, 1, 88, 255);
+
+      const lc = this.lctx;
+      lc.setTransform(DPR, 0, 0, DPR, 0, 0);
+      lc.clearRect(0, 0, this.lw, this.lh);
+      lc.font = this.size + 'px "SongTi", "Noto Serif SC", serif';
+      lc.fillStyle = 'rgba(0,0,0,' + (alpha / 255) + ')';
+      lc.textBaseline = 'alphabetic';
+      lc.fillText(this.content, 20, this.size + 16);
+
+      // 关键：用 CSS filter 做模糊，iOS Safari / 微信内置浏览器都支持
+      this.canvas.style.filter = blurAmount > 0.1 ? 'blur(' + blurAmount + 'px)' : 'none';
+    }
+  }
+
+  // ===== RainDrop：画在 fx 层上（fx 元素整体带 CSS blur，替代原版 layer.filter(BLUR)）=====
+  class RainDrop {
+    constructor(x, y) {
+      this.x = x; this.y = y;
+      this.age = 0;
+      this.stainSize = rand(12, 24);
+      this.maxRipple = rand(70, 105);
+      this.justLanded = true;
+      this.finished = false;
+    }
+    update() {
+      if (this.age > 0) this.justLanded = false;
+      this.age++;
+      if (this.age > waterLife) this.finished = true;
+    }
+    display() {
+      const p = clamp(this.age / waterLife, 0, 1);
+      const rippleSize = this.easeOut(p) * this.maxRipple;
+      const fade = 1 - this.smooth(0.42, 1.0, p);
+      const appear = this.smooth(0.0, 0.12, p);
+
+      const lc = fxCtx;
+      const [dr, dg, db] = rippleDarkColor;
+      const [lr, lg, lb] = rippleLightColor;
+
+      // 底部水渍
+      lc.beginPath();
+      lc.arc(this.x, this.y, (this.stainSize + rippleSize * 0.18) / 2, 0, Math.PI * 2);
+      lc.fillStyle = `rgba(${dr},${dg},${db},${(18 * fade) / 255})`;
+      lc.fill();
+
+      // 同心水波
+      lc.lineWidth = 5;
+      this.ring(lc, this.x - 1.2, this.y - 1.2, rippleSize * 0.96, `rgba(${lr},${lg},${lb},${(rippleLightAlpha * fade * appear) / 255})`);
+      lc.lineWidth = 3;
+      this.ring(lc, this.x + 1.4, this.y + 1.4, rippleSize, `rgba(${dr},${dg},${db},${(rippleDarkAlpha * fade * appear) / 255})`);
+      lc.lineWidth = 4;
+      this.ring(lc, this.x, this.y, rippleSize * 0.62, `rgba(${dr},${dg},${db},${(rippleDarkAlpha * 0.28 * fade * appear) / 255})`);
+      lc.lineWidth = 2;
+      this.ring(lc, this.x, this.y, rippleSize * 1.18, `rgba(${lr},${lg},${lb},${(rippleLightAlpha * 0.5 * fade * appear) / 255})`);
+    }
+    ring(lc, ox, oy, d, style) {
+      lc.beginPath();
+      lc.arc(ox, oy, d / 2, 0, Math.PI * 2);
+      lc.strokeStyle = style;
+      lc.stroke();
+    }
+    easeOut(t) { return 1 - Math.pow(1 - t, 3); }
+    smooth(e0, e1, v) {
+      const t = clamp((v - e0) / (e1 - e0), 0, 1);
+      return t * t * (3 - 2 * t);
+    }
+  }
+
+  // ===== 场景初始化（在字体加载完成后调用，保证宽度测量准确）=====
+  const lines = [];
+  function buildLines() {
+    lines.length = 0;
+    let y = poemStartY;
+    for (const para of paragraphs) {
+      for (const text of para) {
+        lines.push(new LineText(text, letterX, y, poemTextSize));
+        y += lineGap;
+      }
+      y = y - lineGap + paragraphGap;
+    }
+    lines.push(new LineText("Jean。", loveTextX, loveTextY, loveTextSize));
+  }
+
+  const rainDrops = [];
+  const bg = new Image();
+  let started = false;
+  let bgDrawn = false;
+
+  function start() {
+    if (started) return;
+    started = true;
+    requestAnimationFrame(loop);
+  }
+
+  bg.onload = start;
+  bg.onerror = () => {
+    // 背景加载失败时用纯色代替，保证信仍然可读
+    bgCtx.fillStyle = '#efe9dc';
+    bgCtx.fillRect(0, 0, W, H);
+    bgDrawn = true;
+    start();
+  };
+
+  // 先加载宋体，再加载背景，最后开始渲染（保证文字宽度测量准确）
+  async function init() {
+    try {
+      const face = new FontFace('SongTi', 'url(font.ttf)');
+      await face.load();
+      document.fonts.add(face);
+    } catch (e) { /* 字体加载失败则退回系统衬线字体 */ }
+    buildLines();
+    bg.src = 'background.jpg';
+  }
+  init();
+
+  function findClosestLine() {
+    let idx = -1, closest = mouseAffectDistance;
+    for (let i = 0; i < lines.length; i++) {
+      const d = lines[i].distanceTo(mouseX, mouseY);
+      if (d < closest) { closest = d; idx = i; }
+    }
+    return idx;
+  }
+
+  function loop() {
+    if (started) requestAnimationFrame(loop);
+
+    if (!bgDrawn) {
+      if (bg.complete && bg.naturalWidth) bgCtx.drawImage(bg, 0, 0, W, H);
+      else { bgCtx.fillStyle = '#efe9dc'; bgCtx.fillRect(0, 0, W, H); }
+      bgDrawn = true;
+    }
+
+    fxCtx.clearRect(0, 0, W, H);
+    if (rainDrops.length < maxRainDrops && Math.random() < rainChance) {
+      rainDrops.push(new RainDrop(rand(70, W - 70), rand(140, 560)));
+    }
+
+    for (let i = rainDrops.length - 1; i >= 0; i--) {
+      const drop = rainDrops[i];
+      drop.update();
+      drop.display();
+      if (drop.justLanded) for (const line of lines) line.addRainBoost(drop.x, drop.y);
+      if (drop.finished) rainDrops.splice(i, 1);
+    }
+
+    const active = findClosestLine();
+    for (let i = 0; i < lines.length; i++) {
+      lines[i].update(i === active);
+      lines[i].display();
+    }
+  }
+})();
+</script>
+</body>
+</html>
